@@ -2,6 +2,8 @@
 
 An interactive browser-based visualization that simulates wildfire spread with fractal-like patterns. This project combines artistic visualization with educational elements about fire behavior.
 
+Can also be found at: https://paladinindustries.com/Fire_Fractal.html
+
 ## Overview
 
 This visualization uses HTML5 Canvas to render a real-time simulation of wildfire spreading across a landscape. The fire exhibits fractal-like behaviors, creating self-similar patterns at different scales. As the fire grows, the simulation automatically downsamples to maintain performance while preserving the visual appearance of continual growth.
