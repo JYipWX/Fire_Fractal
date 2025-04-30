@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Continuous Fractal Wildfire</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            display: block;
+        }
+        .micIndicator {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: #f00;
+            box-shadow: 0 0 5px #f00;
+            z-index: 10;
+            transition: background-color 0.3s, box-shadow 0.3s;
+        }
+        .micIndicator.active {
+            background-color: #0f0;
+            box-shadow: 0 0 10px #0f0;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="fireCanvas"></canvas>
+    
+    <div class="micIndicator" id="micIndicator" title="Microphone status"></div>
+
+    <script>
+        // Canvas setup
+        const canvas = document.getElementById('fireCanvas');
+        const ctx = canvas.getContext('2d');
+        const micIndicator = document.getElementById('micIndicator');
+        
+        // Make canvas fill the window
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        
+        // Core simulation parameters
+        let GRID_SIZE = 50;
+        const MIN_GRID_SIZE = 50;
+        const MAX_GRID_SIZE = 300; // Cap grid size at 300x300 for performance
+        const INITIAL_CELL_SIZE = 8;
+        const MIN_CELL_SIZE = 4; // Minimum cell size to prevent fire from becoming too small
+        let cellSize = INITIAL_CELL_SIZE;
+        let viewAngle = Math.PI / 4;
+        let windIntensity = 0.1;
+        let isDragging = false;
+        let prevMouseX = 0;
+        
+        // Downsampling parameters
+        let downsampleCount = 0;
+        let cumulativeScale = 1.0;
+        let targetCumulativeScale = 1.0;
+        const DOWNSAMPLE_THRESHOLD = 0.7; // Downsample when fire covers this fraction of the grid
+        const DOWNSAMPLING_RATIO = 0.5; // How much to reduce resolution (0.5 = half)
+        let isDownsampling = false;
+        let downsampleAnimationStart = 0;
+        const DOWNSAMPLE_ANIMATION_DURATION = 2000; // 2 second animation for smoother transition
+        
+        // Fire simulation grids
+        let fireGrid = [];
+        let nextFireGrid = [];
+        let burnedGrid = [];
+        
+        // Audio elements
+        let audioContext, analyser, microphone, dataArray;
+        let isMicEnabled = false;
+        
+        // Fire spread parameters - higher values = more intense response
+        const WIND_AMPLIFICATION = 1.5;  // How much volume affects wind intensity
+        const SPREAD_BASE_PROB = 0.02;   // Base probability for fire spread
+        const SPREAD_WIND_MULT = 4.0;    // How much wind increases spread in wind direction
+        const JUMP_PROBABILITY = 0.02;   // Base probability for fire jumps
+        const JUMP_WIND_MULT = 12.0;      // How much wind increases jump probability
+        const MAX_JUMP_DISTANCE = 6;     // Maximum jump distance at highest wind
+        
+        // Initialize the grids
+        function initGrids() {
+            fireGrid = Array(GRID_SIZE).fill().map(() => Array(GRID_SIZE).fill(0));
+            nextFireGrid = Array(GRID_SIZE).fill().map(() => Array(GRID_SIZE).fill(0));
+            burnedGrid = Array(GRID_SIZE).fill().map(() => Array(GRID_SIZE).fill(0));
+        }
+        
+        // Start fire in center bottom area
+        function startFire() {
+            const centerX = Math.floor(GRID_SIZE / 2);
+            const startY = Math.floor(GRID_SIZE * 0.8);
+            const radius = 3;
+            
+            for (let i = centerX - radius; i <= centerX + radius; i++) {
+                for (let j = startY - radius; j <= startY + radius; j++) {
+                    if (i >= 0 && i < GRID_SIZE && j >= 0 && j < GRID_SIZE) {
+                        // Start with max fire intensity
+                        fireGrid[i][j] = 1.0;
+                    }
+                }
+            }
+        }
+        
+        // Setup event listeners
+        function setupEventListeners() {
+            // Mouse rotation
+            canvas.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                prevMouseX = e.clientX;
+            });
+            
+            canvas.addEventListener('mouseup', () => {
+                isDragging = false;
+            });
+            
+            canvas.addEventListener('mousemove', (e) => {
+                if (isDragging) {
+                    const deltaX = e.clientX - prevMouseX;
+                    viewAngle += deltaX * 0.01;
+                    prevMouseX = e.clientX;
+                }
+            });
+            
+            // Window resize
+            window.addEventListener('resize', () => {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            });
+            
+            // Setup microphone automatically
+            setupMicrophone();
+        }
+        
+        // Setup microphone for wind intensity
+        function setupMicrophone() {
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    isMicEnabled = true;
+                    micIndicator.classList.add('active');
+                    
+                    // Audio analysis setup
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    analyser = audioContext.createAnalyser();
+                    microphone = audioContext.createMediaStreamSource(stream);
+                    microphone.connect(analyser);
+                    analyser.fftSize = 32;
+                    
+                    dataArray = new Uint8Array(analyser.frequencyBinCount);
+                })
+                .catch(err => {
+                    console.error('Error accessing microphone:', err);
+                });
+            }
+        }
+        
+        // Check if grid needs expansion (early in development)
+        function checkGridExpansion() {
+            // Check if fire has reached boundaries
+            let edgeFire = false;
+            
+            // Check edges
+            for (let i = 0; i < GRID_SIZE; i++) {
+                if (fireGrid[i][0] > 0.1 || fireGrid[i][GRID_SIZE-1] > 0.1 || 
+                    fireGrid[0][i] > 0.1 || fireGrid[GRID_SIZE-1][i] > 0.1) {
+                    edgeFire = true;
+                    break;
+                }
+            }
+            
+            // Expand if needed and not at max size
+            if (edgeFire && GRID_SIZE < MAX_GRID_SIZE) {
+                expandGrid();
+                return true;
+            }
+            return false;
+        }
+        
+        // Expand the grid to allow more fire spread
+        function expandGrid() {
+            // Calculate new dimensions, respecting MAX_GRID_SIZE
+            const expansionSize = Math.min(20, MAX_GRID_SIZE - GRID_SIZE);
+            if (expansionSize <= 0) return;
+            
+            const newSize = GRID_SIZE + expansionSize;
+            const offset = Math.floor(expansionSize / 2);
+            
+            // Create new arrays
+            const newFireGrid = Array(newSize).fill().map(() => Array(newSize).fill(0));
+            const newNextFireGrid = Array(newSize).fill().map(() => Array(newSize).fill(0));
+            const newBurnedGrid = Array(newSize).fill().map(() => Array(newSize).fill(0));
+            
+            // Copy old data to center of new arrays
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    newFireGrid[i + offset][j + offset] = fireGrid[i][j];
+                    newNextFireGrid[i + offset][j + offset] = nextFireGrid[i][j];
+                    newBurnedGrid[i + offset][j + offset] = burnedGrid[i][j];
+                }
+            }
+            
+            // Replace old arrays with new ones
+            fireGrid = newFireGrid;
+            nextFireGrid = newNextFireGrid;
+            burnedGrid = newBurnedGrid;
+            GRID_SIZE = newSize;
+        }
+        
+        // Check if downsampling is needed
+        function checkDownsamplingNeeded() {
+            // If already at maximum size or fire coverage is high, downsample
+            if (GRID_SIZE >= MAX_GRID_SIZE) {
+                return true;
+            }
+            
+            // Check fire coverage
+            const bounds = calculateFireBounds();
+            if (bounds.activeCells === 0) return false;
+            
+            // Calculate how much of the grid is covered by fire
+            const coverage = bounds.activeCells / (GRID_SIZE * GRID_SIZE);
+            return coverage > DOWNSAMPLE_THRESHOLD;
+        }
+        
+        // Downsample the fire grid
+        function downsampleFire() {
+            if (isDownsampling) return; // Already in progress
+            
+            isDownsampling = true;
+            downsampleAnimationStart = Date.now();
+            
+            // Calculate new grid size
+            const newSize = Math.max(MIN_GRID_SIZE, Math.floor(GRID_SIZE * DOWNSAMPLING_RATIO));
+            
+            // Create new grids
+            const newFireGrid = Array(newSize).fill().map(() => Array(newSize).fill(0));
+            const newNextFireGrid = Array(newSize).fill().map(() => Array(newSize).fill(0));
+            const newBurnedGrid = Array(newSize).fill().map(() => Array(newSize).fill(0));
+            
+            // Downsample by averaging
+            const scaleFactor = GRID_SIZE / newSize;
+            
+            for (let newI = 0; newI < newSize; newI++) {
+                for (let newJ = 0; newJ < newSize; newJ++) {
+                    // Calculate region in original grid to sample from
+                    const startI = Math.floor(newI * scaleFactor);
+                    const endI = Math.min(GRID_SIZE - 1, Math.floor((newI + 1) * scaleFactor - 1));
+                    const startJ = Math.floor(newJ * scaleFactor);
+                    const endJ = Math.min(GRID_SIZE - 1, Math.floor((newJ + 1) * scaleFactor - 1));
+                    
+                    // Calculate average values
+                    let fireSum = 0;
+                    let burnedSum = 0;
+                    let count = 0;
+                    
+                    for (let i = startI; i <= endI; i++) {
+                        for (let j = startJ; j <= endJ; j++) {
+                            fireSum += fireGrid[i][j];
+                            burnedSum += burnedGrid[i][j];
+                            count++;
+                        }
+                    }
+                    
+                    // Set new cell values
+                    if (count > 0) {
+                        newFireGrid[newI][newJ] = fireSum / count;
+                        newBurnedGrid[newI][newJ] = burnedSum / count;
+                    }
+                }
+            }
+            
+            // Update tracking info - but don't excessively scale down visuals
+            downsampleCount++;
+            
+            // This is key: we're limiting how much we visually scale down
+            // After first few downsamples, we'll maintain visual size
+            if (downsampleCount <= 2) {
+                targetCumulativeScale = cumulativeScale * scaleFactor* 3.5; // Scale down more aggressively initially
+            } else {
+                // After initial downsamples, maintain visual size by only slightly adjusting scale
+                targetCumulativeScale = cumulativeScale * scaleFactor;
+            }
+            
+            // Replace old grids with downsampled ones
+            fireGrid = newFireGrid;
+            nextFireGrid = newNextFireGrid;
+            burnedGrid = newBurnedGrid;
+            GRID_SIZE = newSize;
+            
+            // Schedule end of animation
+            setTimeout(() => {
+                isDownsampling = false;
+                // Final update to ensure we reach exactly the target scale
+                cumulativeScale = targetCumulativeScale;
+            }, DOWNSAMPLE_ANIMATION_DURATION);
+        }
+        
+        // Get view direction vector in screen space
+        function getViewDirectionVector() {
+            // In screen space, the direction is up (negative y-axis)
+            return {
+                x: 0,
+                y: -1
+            };
+        }
+        
+        // Convert screen-space direction to grid-space direction
+        function screenToGridDirection(screenDir) {
+            // Apply inverse rotation to convert screen direction to grid direction
+            return {
+                x: screenDir.x * Math.cos(-viewAngle) - screenDir.y * Math.sin(-viewAngle),
+                y: screenDir.x * Math.sin(-viewAngle) + screenDir.y * Math.cos(-viewAngle)
+            };
+        }
+        
+        // Update fire spread based on current state
+        function updateFireSpread() {
+            // Check if expansion or downsampling needed
+            const expanded = checkGridExpansion();
+            
+            // If we didn't expand and downsample conditions are met, downsample
+            if (!expanded && !isDownsampling && checkDownsamplingNeeded()) {
+                downsampleFire();
+                return; // Skip this update cycle during downsampling
+            }
+            
+            // Get view direction for wind influence (in screen space)
+            const screenDir = getViewDirectionVector();
+            
+            // Convert to grid space direction
+            const gridDir = screenToGridDirection(screenDir);
+            
+            // Scale for extra fire effects at high wind
+            const intensityScaling = 1 + Math.pow(windIntensity, 2) * 3;
+            
+            // Copy current state to next state
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    nextFireGrid[i][j] = fireGrid[i][j];
+                }
+            }
+            
+            // Apply fire spread rules
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    // Skip if already burned out
+                    if (burnedGrid[i][j] >= 0.95) continue;
+                    
+                    // Process cells on fire
+                    if (fireGrid[i][j] > 0) {
+                        // Increase burn rate - scale with wind for faster burning in heavy wind
+                        const burnRate = 0.01 * (1 + windIntensity * 0.5);
+                        burnedGrid[i][j] = Math.min(1.0, burnedGrid[i][j] + burnRate);
+                        
+                        // Reduce fire intensity if cell is burning out
+                        if (burnedGrid[i][j] > 0.7) {
+                            nextFireGrid[i][j] = Math.max(0, fireGrid[i][j] - 0.05);
+                        }
+                        
+                        // Fire spread to neighbors
+                        for (let di = -1; di <= 1; di++) {
+                            for (let dj = -1; dj <= 1; dj++) {
+                                const ni = i + di;
+                                const nj = j + dj;
+                                
+                                // Skip if out of bounds or same cell
+                                if (ni < 0 || ni >= GRID_SIZE || nj < 0 || nj >= GRID_SIZE || (di === 0 && dj === 0)) {
+                                    continue;
+                                }
+                                
+                                // Skip if neighbor is already burning strongly or burned out
+                                if (fireGrid[ni][nj] > 0.7 || burnedGrid[ni][nj] > 0.6) {
+                                    continue;
+                                }
+                                
+                                // Calculate spread probability - increased base value for more spread
+                                let spreadProb = fireGrid[i][j] * SPREAD_BASE_PROB * intensityScaling;
+                                
+                                // Calculate alignment with wind direction in grid space
+                                const dirDot = (di * gridDir.x + dj * gridDir.y) / 
+                                               Math.sqrt(di*di + dj*dj);
+                                
+                                // Higher probability in wind direction - much stronger effect
+                                if (dirDot > 0) {
+                                    spreadProb *= (1 + windIntensity * SPREAD_WIND_MULT * dirDot);
+                                }
+                                
+                                // Add fractal-like randomness
+                                if (Math.random() < 0.2) {
+                                    spreadProb *= 2;
+                                }
+                                
+                                // Create "jumps" for fractal patterns in wind direction - more intense with wind
+                                if (Math.random() < JUMP_PROBABILITY * windIntensity * JUMP_WIND_MULT) {
+                                    // Jump distance increases with wind intensity
+                                    const jumpDistBase = 1 + Math.floor(Math.random() * 3);
+                                    const jumpDist = Math.min(
+                                        MAX_JUMP_DISTANCE, 
+                                        jumpDistBase + Math.floor(windIntensity * 4)
+                                    );
+                                    
+                                    // Multiple jumps when wind is strong
+                                    const numJumps = windIntensity > 0.7 ? 
+                                        1 + Math.floor(Math.random() * 3) : 1;
+                                    
+                                    for (let jump = 0; jump < numJumps; jump++) {
+                                        // Angle varies slightly around the wind direction
+                                        const angleVar = (Math.random() - 0.5) * Math.PI / 4; // ±22.5 degrees
+                                        const jumpDirX = gridDir.x * Math.cos(angleVar) - gridDir.y * Math.sin(angleVar);
+                                        const jumpDirY = gridDir.x * Math.sin(angleVar) + gridDir.y * Math.cos(angleVar);
+                                        
+                                        // Jump in wind direction based on grid direction with variance
+                                        const jumpI = ni + Math.round(jumpDirX * jumpDist);
+                                        const jumpJ = nj + Math.round(jumpDirY * jumpDist);
+                                        
+                                        if (jumpI >= 0 && jumpI < GRID_SIZE && jumpJ >= 0 && jumpJ < GRID_SIZE) {
+                                            if (fireGrid[jumpI][jumpJ] < 0.1 && burnedGrid[jumpI][jumpJ] < 0.1) {
+                                                // More intense fire at higher wind speeds
+                                                const newIntensity = 0.7 + Math.random() * 0.3 * (1 + windIntensity);
+                                                nextFireGrid[jumpI][jumpJ] = Math.min(1.0, newIntensity);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Apply spread
+                                if (Math.random() < spreadProb) {
+                                    const newFire = 0.2 * (1 + windIntensity);
+                                    nextFireGrid[ni][nj] = Math.min(1.0, nextFireGrid[ni][nj] + newFire);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Update current grid
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    fireGrid[i][j] = nextFireGrid[i][j];
+                }
+            }
+        }
+        
+        // Calculate fire bounds to determine view
+        function calculateFireBounds() {
+            let minI = GRID_SIZE;
+            let maxI = 0;
+            let minJ = GRID_SIZE;
+            let maxJ = 0;
+            let activeCells = 0;
+            
+            // Find active fire bounds
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    if (fireGrid[i][j] > 0.1) {
+                        minI = Math.min(minI, i);
+                        maxI = Math.max(maxI, i);
+                        minJ = Math.min(minJ, j);
+                        maxJ = Math.max(maxJ, j);
+                        activeCells++;
+                    }
+                }
+            }
+            
+            // Return default if no fire
+            if (activeCells === 0) {
+                return {
+                    width: GRID_SIZE / 2,
+                    height: GRID_SIZE / 2,
+                    activeCells: 0
+                };
+            }
+            
+            // Calculate width and height of fire area
+            return {
+                minI: minI,
+                maxI: maxI,
+                minJ: minJ,
+                maxJ: maxJ,
+                width: maxI - minI + 1,
+                height: maxJ - minJ + 1,
+                activeCells: activeCells
+            };
+        }
+        
+        // Draw fire grid with simple wireframe look
+        function drawFireGrid() {
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Calculate center point of canvas
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+            
+            // Update cumulative scale smoothly during transition
+            if (isDownsampling) {
+                const elapsed = Date.now() - downsampleAnimationStart;
+                const progress = Math.min(1.0, elapsed / DOWNSAMPLE_ANIMATION_DURATION);
+                
+                // Use easeInOutQuad easing function for smoother transition
+                let easedProgress;
+                if (progress < 0.5) {
+                    easedProgress = 2 * progress * progress;
+                } else {
+                    easedProgress = 1 - Math.pow(-2 * progress + 2, 2) / 2;
+                }
+                
+                // Smoothly interpolate between old and new scale
+                cumulativeScale = (1.0 - easedProgress) * (targetCumulativeScale / DOWNSAMPLING_RATIO) + 
+                                 easedProgress * targetCumulativeScale;
+            }
+            
+            // Calculate cell size based on cumulative scale, but with a minimum value
+            // This is the key change to prevent fire from getting too small
+            const scaleAdjustment = Math.min(Math.sqrt(cumulativeScale), 2.5); // Limit the max scaling effect
+            const displayCellSize = Math.max(MIN_CELL_SIZE, INITIAL_CELL_SIZE / scaleAdjustment);
+            
+            // Draw ground grid first
+            drawGroundGrid(centerX, centerY, displayCellSize);
+            
+            // Draw each cell
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    // Skip empty cells
+                    if (fireGrid[i][j] <= 0 && burnedGrid[i][j] < 0.1) continue;
+                    
+                    // Calculate oblique projection coordinates
+                    const xOffset = ((i - GRID_SIZE/2) * Math.cos(viewAngle) - (j - GRID_SIZE/2) * Math.sin(viewAngle)) * displayCellSize;
+                    const yOffset = ((i - GRID_SIZE/2) * Math.sin(viewAngle) + (j - GRID_SIZE/2) * Math.cos(viewAngle)) * displayCellSize * 0.5;
+                    
+                    const x = centerX + xOffset;
+                    const y = centerY + yOffset;
+                    
+                    // Determine ground color based on burned state
+                    let groundColor;
+                    if (burnedGrid[i][j] < 0.1) {
+                        // Unburned - golden
+                        groundColor = "rgb(218, 165, 32)";
+                    } else if (burnedGrid[i][j] < 0.5) {
+                        // Burning - golden to dark amber
+                        const t = burnedGrid[i][j] / 0.5;
+                        const r = Math.floor(218 * (1 - t) + 139 * t);
+                        const g = Math.floor(165 * (1 - t) + 69 * t);
+                        const b = Math.floor(32 * (1 - t) + 19 * t);
+                        groundColor = `rgb(${r}, ${g}, ${b})`;
+                    } else {
+                        // Burned - dark amber to black
+                        const t = (burnedGrid[i][j] - 0.5) / 0.5;
+                        const r = Math.floor(139 * (1 - t));
+                        const g = Math.floor(69 * (1 - t));
+                        const b = Math.floor(19 * (1 - t));
+                        groundColor = `rgb(${r}, ${g}, ${b})`;
+                    }
+                    
+                    // Draw ground cell wireframe
+                    ctx.strokeStyle = groundColor;
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.rect(x - displayCellSize/2, y - displayCellSize/4, displayCellSize, displayCellSize/2);
+                    ctx.stroke();
+                    
+                    // Draw fire if cell is burning
+                    if (fireGrid[i][j] > 0.1) {
+                        // Calculate flame height - make flames taller with wind
+                        const heightMult = 1 + (windIntensity * windIntensity * 3);
+                        const flameHeight = fireGrid[i][j] * displayCellSize * 2 * heightMult;
+                        
+                        // Add randomness - more movement in high wind
+                        const timeScale = 0.01 * (1 + windIntensity);
+                        const flameRandom = Math.sin(Date.now() * timeScale + i * 0.5 + j * 0.3) * (0.1 + windIntensity * 0.1);
+                        const actualHeight = flameHeight * (1 + flameRandom);
+                        
+                        // Create flame color - crimson palette with more intensity at high wind
+                        let flameColor;
+                        if (burnedGrid[i][j] < 0.3) {
+                            // Bright crimson flame - brighter with more wind
+                            const r = 220 + Math.min(35, Math.floor(windIntensity * 35));
+                            const g = Math.floor(20 + fireGrid[i][j] * 30 + windIntensity * 15);
+                            const b = Math.floor(60 + fireGrid[i][j] * 30);
+                            flameColor = `rgb(${r}, ${g}, ${b})`;
+                        } else if (burnedGrid[i][j] < 0.7) {
+                            // Crimson to deeper red as it burns
+                            const r = Math.floor(220 - (burnedGrid[i][j] - 0.3) * 50);
+                            const g = Math.floor(50 * (1 - (burnedGrid[i][j] - 0.3) / 0.4));
+                            const b = Math.floor(90 * (1 - (burnedGrid[i][j] - 0.3) / 0.4));
+                            flameColor = `rgb(${r}, ${g}, ${b})`;
+                        } else {
+                            // Deep red to dark red as it burns out
+                            const r = Math.floor(170 * (1 - (burnedGrid[i][j] - 0.7) / 0.3));
+                            const g = 10;
+                            const b = 20;
+                            flameColor = `rgb(${r}, ${g}, ${b})`;
+                        }
+                        
+                        // Draw flame wireframe - add wind-based lean
+                        const leanFactor = windIntensity * 0.4;
+                        const screenWindDir = getViewDirectionVector();
+                        
+                        ctx.strokeStyle = flameColor;
+                        ctx.beginPath();
+                        ctx.moveTo(x, y);
+                        
+                        // Left side of flame with wind lean
+                        ctx.lineTo(
+                            x - displayCellSize * 0.3 + screenWindDir.x * leanFactor * actualHeight,
+                            y - actualHeight + screenWindDir.y * leanFactor * actualHeight
+                        );
+                        
+                        // Right side of flame with wind lean
+                        ctx.lineTo(
+                            x + displayCellSize * 0.3 + screenWindDir.x * leanFactor * actualHeight,
+                            y - actualHeight + screenWindDir.y * leanFactor * actualHeight
+                        );
+                        
+                        ctx.closePath();
+                        ctx.stroke();
+                        
+                        // At high wind speeds, add extra embers/sparks
+                        if (windIntensity > 0.6 && Math.random() < windIntensity * 0.3) {
+                            const emberCount = Math.floor(windIntensity * 10) + 1;
+                            for (let e = 0; e < emberCount; e++) {
+                                const emberSize = 1 + Math.random() * 2;
+                                const emberDist = Math.random() * actualHeight * 0.7;
+                                const emberOffsetX = (Math.random() - 0.5) * displayCellSize + screenWindDir.x * emberDist * 0.8;
+                                const emberOffsetY = -emberDist + screenWindDir.y * emberDist * 0.8;
+                                
+                                ctx.fillStyle = `rgba(255, ${Math.floor(150 + Math.random() * 105)}, 50, 0.8)`;
+                                ctx.beginPath();
+                                ctx.arc(x + emberOffsetX, y + emberOffsetY, emberSize, 0, Math.PI * 2);
+                                ctx.fill();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Draw ground grid for orientation
+        function drawGroundGrid(centerX, centerY, cellSize) {
+            // Calculate extended grid size to show terrain beyond the fire area
+            const extendedSize = GRID_SIZE * 2.5; // Increased from 1.5 to make grid larger
+            const halfExtended = extendedSize / 2;
+            
+            // Use BRIGHTER colors for the ground grid
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";  // Light gray, semi-transparent
+            ctx.lineWidth = 0.8;
+            
+            // Draw subtle terrain color - slight gradient from dark to lighter
+            ctx.fillStyle = "rgba(40, 30, 20, 0.3)";
+            
+            // Draw a ground plane rectangle
+            const corners = [
+                { i: -halfExtended, j: -halfExtended },
+                { i: halfExtended, j: -halfExtended },
+                { i: halfExtended, j: halfExtended },
+                { i: -halfExtended, j: halfExtended }
+            ];
+            
+            // Transform corners to screen space
+            const screenCorners = corners.map(corner => {
+                const x = ((corner.i) * Math.cos(viewAngle) - (corner.j) * Math.sin(viewAngle)) * cellSize;
+                const y = ((corner.i) * Math.sin(viewAngle) + (corner.j) * Math.cos(viewAngle)) * cellSize * 0.5;
+                return { x: centerX + x, y: centerY + y };
+            });
+            
+            // Draw the ground plane
+            ctx.beginPath();
+            ctx.moveTo(screenCorners[0].x, screenCorners[0].y);
+            for (let i = 1; i < screenCorners.length; i++) {
+                ctx.lineTo(screenCorners[i].x, screenCorners[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            
+            // Draw grid lines for every cell instead of every 5 cells
+            // Calculate step size for grid lines based on cell density
+            const gridDensity = 5; // Draw a line for every grid cell
+            
+            // Draw grid lines along i axis (roughly horizontal in oblique view)
+            for (let i = -halfExtended; i <= halfExtended; i += gridDensity) {
+                const startX1 = ((i) * Math.cos(viewAngle) - (-halfExtended) * Math.sin(viewAngle)) * cellSize;
+                const startY1 = ((i) * Math.sin(viewAngle) + (-halfExtended) * Math.cos(viewAngle)) * cellSize * 0.5;
+                const endX1 = ((i) * Math.cos(viewAngle) - (halfExtended) * Math.sin(viewAngle)) * cellSize;
+                const endY1 = ((i) * Math.sin(viewAngle) + (halfExtended) * Math.cos(viewAngle)) * cellSize * 0.5;
+                
+                ctx.beginPath();
+                ctx.moveTo(centerX + startX1, centerY + startY1);
+                ctx.lineTo(centerX + endX1, centerY + endY1);
+                ctx.stroke();
+            }
+            
+            // Draw grid lines along j axis (roughly vertical in oblique view)
+            for (let j = -halfExtended; j <= halfExtended; j += gridDensity) {
+                const startX2 = ((-halfExtended) * Math.cos(viewAngle) - (j) * Math.sin(viewAngle)) * cellSize;
+                const startY2 = ((-halfExtended) * Math.sin(viewAngle) + (j) * Math.cos(viewAngle)) * cellSize * 0.5;
+                const endX2 = ((halfExtended) * Math.cos(viewAngle) - (j) * Math.sin(viewAngle)) * cellSize;
+                const endY2 = ((halfExtended) * Math.sin(viewAngle) + (j) * Math.cos(viewAngle)) * cellSize * 0.5;
+                
+                ctx.beginPath();
+                ctx.moveTo(centerX + startX2, centerY + startY2);
+                ctx.lineTo(centerX + endX2, centerY + endY2);
+                ctx.stroke();
+            }
+        }
+        
+        // Update microphone input
+        function updateMicrophoneInput() {
+            if (!isMicEnabled || !analyser) return;
+            
+            analyser.getByteFrequencyData(dataArray);
+            
+            // Calculate average volume
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+                sum += dataArray[i];
+            }
+            const avgVolume = sum / dataArray.length / 255;
+            
+            // Enhanced amplification with non-linear response
+            // This makes louder sounds have a much stronger effect
+            const amplifiedVolume = Math.pow(avgVolume, 1.5) * WIND_AMPLIFICATION;
+            
+            // Smooth transition to new wind intensity
+            windIntensity = windIntensity * 0.7 + amplifiedVolume * 0.3;
+            windIntensity = Math.min(1.0, windIntensity);
+            
+            // Visual feedback on microphone status - more dramatic at high intensity
+            const glowSize = 10 + windIntensity * 20;
+            const glowIntensity = Math.min(1.0, windIntensity * 1.5);
+            micIndicator.style.boxShadow = `0 0 ${glowSize}px rgba(0, 255, 0, ${glowIntensity})`;
+            
+            // Change color of indicator at high wind speeds
+            if (windIntensity > 0.8) {
+                micIndicator.style.backgroundColor = `rgb(0, 255, ${Math.floor(255 - windIntensity * 255)})`;
+            } else {
+                micIndicator.style.backgroundColor = "#0f0";
+            }
+        }
+        
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Update wind from microphone
+            updateMicrophoneInput();
+            
+            // Skip fire spread during downsampling animation
+            if (!isDownsampling) {
+                // Update fire spread (not every frame for performance)
+                // Higher update rate at high wind speeds
+                if (Math.random() < 0.3 + windIntensity * 0.3) {
+                    updateFireSpread();
+                }
+            }
+            
+            // Draw visualization
+            drawFireGrid();
+        }
+        
+        // Initialize everything
+        function init() {
+            // Setup grid and fire
+            initGrids();
+            startFire();
+            
+            // Setup user interactions
+            setupEventListeners();
+            
+            // Start animation
+            animate();
+        }
+        
+        // Start the simulation
+        init();
+    </script>
+</body>
+</html>
